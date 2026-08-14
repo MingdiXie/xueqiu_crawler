@@ -26,10 +26,6 @@ python3 generate_posts_pdf.py xueqiu_posts.json
 默认输出到 `output/pdf/xueqiu_posts.pdf`。日期可点击并跳转到对应雪球帖子。常用选项：
 
 ```bash
-# 先生成 20 条帖子预览
-python3 generate_posts_pdf.py xueqiu_posts.json --limit 20 \
-  --output output/pdf/xueqiu_posts_preview.pdf
-
 # 按日期筛选，并显示关联原帖摘要
 python3 generate_posts_pdf.py xueqiu_posts.json \
   --start-date 2025-01-01 --end-date 2025-12-31 \
@@ -38,11 +34,15 @@ python3 generate_posts_pdf.py xueqiu_posts.json \
 # 自定义高互动标红阈值（默认：评论≥100、点赞≥1000）
 python3 generate_posts_pdf.py xueqiu_posts.json \
   --hot-reply 50 --hot-like 200
+
+# 只导出点赞数大于 1000 的帖子
+python3 generate_posts_pdf.py xueqiu_posts.json --min-likes 1000 \
+  --output output/pdf/xueqiu_posts_hot.pdf --title "高赞帖子"
 ```
 
 运行 `python3 generate_posts_pdf.py --help` 可查看全部参数。
 
-评论与点赞会分别判断：达到阈值的那一项变为红色，另一项仍保持灰色。
+评论与点赞会分别判断：达到阈值的那一项变为红色，另一项仍保持灰色。`--min-likes` 是内容筛选，与标红阈值互不影响。
 脚本每完成一页就会原子保存进度，并把上一版保留为 `xueqiu_posts.json.bak`。若主文件意外损坏，`--resume` 会自动回退到备份。抓取中断后，使用相同输出文件并增加 `--resume`：
 
 ```bash

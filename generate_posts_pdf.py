@@ -62,6 +62,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-date", help="只保留该日期及之后的帖子（YYYY-MM-DD）")
     parser.add_argument("--end-date", help="只保留该日期及之前的帖子（YYYY-MM-DD）")
     parser.add_argument(
+        "--min-likes",
+        type=int,
+        help="只保留点赞数大于该值的帖子，例如 --min-likes 1000",
+    )
+    parser.add_argument(
         "--include-quoted-post",
         action="store_true",
         help="显示转发或回复所关联的原帖摘要",
@@ -115,6 +120,7 @@ def select_posts(
     start_date: str | None,
     end_date: str | None,
     limit: int | None,
+    min_likes: int | None = None,
 ) -> list[dict[str, Any]]:
     start = datetime.strptime(start_date, "%Y-%m-%d").date() if start_date else None
     end = datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else None
@@ -124,6 +130,8 @@ def select_posts(
         if start and created < start:
             continue
         if end and created > end:
+            continue
+        if min_likes is not None and int(post.get("like_count") or 0) <= min_likes:
             continue
         selected.append(post)
         if limit is not None and len(selected) >= max(limit, 0):
@@ -362,7 +370,9 @@ def main() -> None:
     input_path = Path(args.input).expanduser().resolve()
     output_path = Path(args.output).expanduser().resolve()
     metadata, posts = load_posts(input_path)
-    posts = select_posts(posts, args.start_date, args.end_date, args.limit)
+    posts = select_posts(
+        posts, args.start_date, args.end_date, args.limit, args.min_likes
+    )
     font_name, bold_font = register_fonts()
     styles = make_styles(font_name, bold_font)
     author = (
