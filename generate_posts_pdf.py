@@ -38,6 +38,11 @@ TEXT = colors.HexColor("#27333A")
 MUTED = colors.HexColor("#7A858C")
 LIGHT = colors.HexColor("#E6ECEF")
 QUOTE_BG = colors.HexColor("#F4F7F8")
+HOT = "#C0392B"
+MUTED_HEX = "#7A858C"
+# 评论≥100、点赞≥1000 时标红。
+DEFAULT_HOT_REPLY = 300
+DEFAULT_HOT_LIKE = 1000
 CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 
@@ -60,6 +65,18 @@ def parse_args() -> argparse.Namespace:
         "--include-quoted-post",
         action="store_true",
         help="显示转发或回复所关联的原帖摘要",
+    )
+    parser.add_argument(
+        "--hot-reply",
+        type=int,
+        default=DEFAULT_HOT_REPLY,
+        help=f"评论数达到该值时标红，默认 {DEFAULT_HOT_REPLY}",
+    )
+    parser.add_argument(
+        "--hot-like",
+        type=int,
+        default=DEFAULT_HOT_LIKE,
+        help=f"点赞数达到该值时标红，默认 {DEFAULT_HOT_LIKE}",
     )
     return parser.parse_args()
 
@@ -255,12 +272,19 @@ def date_range(posts: list[dict[str, Any]]) -> str:
     return f"{min(dates):%Y-%m-%d}  至  {max(dates):%Y-%m-%d}"
 
 
+def metric_html(label: str, value: int, threshold: int) -> str:
+    color = HOT if value >= threshold else MUTED_HEX
+    return f'<font color="{color}" size="8">{label} {value:,}</font>'
+
+
 def build_story(
     metadata: dict[str, Any],
     posts: list[dict[str, Any]],
     title: str,
     include_quoted_post: bool,
     styles: dict[str, ParagraphStyle],
+    hot_reply: int,
+    hot_like: int,
 ) -> list[Any]:
     author = (
         posts[0].get("author", {}).get("screen_name")
@@ -296,7 +320,8 @@ def build_story(
         url = escape(str(post.get("url") or ""), quote=True)
         date_line = (
             f'<link href="{url}" color="#356B87">{created:%Y-%m-%d}</link>'
-            f'  <font color="#7A858C" size="8">评论 {replies:,}　点赞 {likes:,}</font>'
+            f"  {metric_html('评论', replies, hot_reply)}"
+            f"　{metric_html('点赞', likes, hot_like)}"
         )
         date_paragraph = Paragraph(date_line, styles["date"])
         item: list[Any] = []
@@ -361,7 +386,13 @@ def main() -> None:
         bottomMargin=18 * mm,
     )
     story = build_story(
-        metadata, posts, args.title, args.include_quoted_post, styles
+        metadata,
+        posts,
+        args.title,
+        args.include_quoted_post,
+        styles,
+        args.hot_reply,
+        args.hot_like,
     )
     document.build(story)
     print(f"已生成：{output_path}（{len(posts):,} 条帖子）")
