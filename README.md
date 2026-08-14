@@ -34,10 +34,15 @@ python3 generate_posts_pdf.py xueqiu_posts.json --limit 20 \
 python3 generate_posts_pdf.py xueqiu_posts.json \
   --start-date 2025-01-01 --end-date 2025-12-31 \
   --include-quoted-post --title "2025 年雪球帖子"
+
+# 自定义高互动标红阈值（默认：评论≥100、点赞≥1000）
+python3 generate_posts_pdf.py xueqiu_posts.json \
+  --hot-reply 50 --hot-like 200
 ```
 
 运行 `python3 generate_posts_pdf.py --help` 可查看全部参数。
 
+评论与点赞会分别判断：达到阈值的那一项变为红色，另一项仍保持灰色。
 脚本每完成一页就会原子保存进度，并把上一版保留为 `xueqiu_posts.json.bak`。若主文件意外损坏，`--resume` 会自动回退到备份。抓取中断后，使用相同输出文件并增加 `--resume`：
 
 ```bash
@@ -100,3 +105,6 @@ python3 xueqiu_crawler.py \
 
 请只抓取公开内容，控制访问频率，并遵守雪球服务条款及适用法律。
 
+```bash
+python3 generate_posts_pdf.py xueqiu_posts.json
+```
