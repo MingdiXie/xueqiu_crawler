@@ -53,7 +53,7 @@ python3 xueqiu_crawler.py \
   --resume
 ```
 
-`--pages 100` 表示最终目标是第 100 页，不是再抓 100 页。断点页会重抓一次并按帖子 ID 去重，以降低中断期间新发言导致分页移动而漏数据的风险。JSON 的 `metadata.last_completed_page` 表示已保存到哪一页，`metadata.complete` 表示目标是否完成。
+`--pages 100` 表示最终目标是第 100 页，不是再抓 100 页。断点页会重抓一次并按帖子 ID 去重，以降低中断期间新发言导致分页移动而漏数据的风险。JSON 的 `metadata.last_completed_page` 表示已保存到哪一页，`metadata.complete` 表示目标是否完成
 
 抓取期间不要在编辑器中修改或保存体积很大的输出 JSON，以免编辑器将文件截断。需要查看进度时，只读取文件开头的 `metadata` 即可。
 
