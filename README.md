@@ -9,11 +9,24 @@ python3 -m pip install -r requirements.txt
 python3 xueqiu_crawler.py
 ```
 
-默认抓取 3 页（约 60 条），输出到 `xueqiu_posts.json`。也可以指定用户、页数和文件名：
+默认抓取 3 页（约 60 条），输出到 `xueqiu_posts.json`。时间线接口经常截断长文，脚本会默认再请求每条帖子的详情接口，把完整正文写入 `text`，并标记 `full_text: true`。也可以指定用户、页数和文件名：
 
 ```bash
 python3 xueqiu_crawler.py 8790885129 --pages 10 --output data/chaojiludinggong.json
 ```
+
+已有旧 JSON 只有摘要时，用相同输出文件加 `--resume` 即可只补全文，不必重抓时间线。如果只想用时间线摘要、加快抓取，可加 `--no-full-text`。
+
+抓取时默认下载帖子原图到 `output/images/<帖子ID>/`，并在 JSON 的 `images` 中写入本地 `path`。补全文时会按去掉 `!thumb` / `!custom` 后的原图地址匹配，避免弄丢已下载路径。若 JSON 里已有图片 URL 但缺少 `path`，同样用 `--resume` 补下载：
+
+```bash
+python3 xueqiu_crawler.py \
+  --cdp-url http://127.0.0.1:9222 \
+  --pages 110 \
+  --resume
+```
+
+不需要本地图片时加 `--no-save-images`。生成 PDF 时会把本地图片按单列大图排进文档。
 
 ## 导出 PDF
 
@@ -23,7 +36,7 @@ python3 xueqiu_crawler.py 8790885129 --pages 10 --output data/chaojiludinggong.j
 python3 generate_posts_pdf.py xueqiu_posts.json
 ```
 
-默认输出到 `output/pdf/xueqiu_posts.pdf`。日期可点击并跳转到对应雪球帖子。常用选项：
+默认输出到 `output/pdf/xueqiu_posts.pdf`。超过 1000 页时会自动拆成 `xueqiu_posts_part01.pdf`、`part02.pdf` 等多份，例如 2500 页会分成 3 个文件。可用 `--pages-per-file` 调整每份页数。日期可点击并跳转到对应雪球帖子。常用选项：
 
 ```bash
 # 按日期筛选，并显示关联原帖摘要

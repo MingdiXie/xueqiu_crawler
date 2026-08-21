@@ -22,9 +22,40 @@ from playwright.sync_api import sync_playwright
 
 BASE_URL = "https://xueqiu.com"
 TIMELINE_API = f"{BASE_URL}/v4/statuses/user_timeline.json"
-DEFAULT_USER_ID = "8790885129"
+STATUS_API = f"{BASE_URL}/statuses/show.json"
+IMAGE_CDN = "https://xqimg.imedao.com"
+FETCH_JSON_JS = """
+async ({url, timeoutMs}) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const response = await fetch(url, {
+            credentials: "include",
+            signal: controller.signal,
+        });
+        const text = await response.text();
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${text.slice(0, 200)}`);
+        }
+        try {
+            return JSON.parse(text);
+        } catch {
+            throw new Error(`接口未返回 JSON: ${text.slice(0, 200)}`);
+        }
+    } catch (error) {
+        if (error?.name === "AbortError") {
+            throw new Error(`请求超时（${timeoutMs / 1000} 秒）`);
+        }
+        throw error;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+"""
+DEFAULT_USER_ID = "2206399908"
 TAG_RE = re.compile(r"<[^>]+>")
 SPACE_RE = re.compile(r"\s+")
+IMG_SRC_RE = re.compile(r"""<img[^>]+src=["']([^"']+)["']""", re.IGNORECASE)
 
 
 def plain_text(value: str | None) -> str:
@@ -35,6 +66,192 @@ def plain_text(value: str | None) -> str:
     value = TAG_RE.sub("", value)
     value = html.unescape(value)
     return SPACE_RE.sub(" ", value).strip()
+
+
+def absolutize_image_url(value: str | None) -> str | None:
+    if not value:
+        return None
+    url = html.unescape(value.strip())
+    if not url or url.startswith("data:"):
+        return None
+    if url.startswith("//"):
+        return f"https:{url}"
+    if url.startswith("http://") or url.startswith("https://"):
+        return url
+    if url.startswith("/"):
+        return f"{IMAGE_CDN}{url}"
+    return f"{IMAGE_CDN}/{url.lstrip('/')}"
+
+
+def extract_image_urls(status: dict[str, Any]) -> list[str]:
+    """提取并去重图片地址，统一返回未缩放的原图 URL。"""
+    urls_by_source: dict[str, str] = {}
+
+    def add(raw: Any) -> None:
+        if not isinstance(raw, str):
+            return
+        absolute = absolutize_image_url(raw)
+        if not absolute:
+            return
+        source = absolute.split("?", 1)[0].split("!", 1)[0]
+        urls_by_source.setdefault(source, source)
+
+    for field in ("text", "description"):
+        html_text = status.get(field) or ""
+        if isinstance(html_text, str):
+            for match in IMG_SRC_RE.finditer(html_text):
+                add(match.group(1))
+
+    for info in status.get("image_info_list") or []:
+        if isinstance(info, dict):
+            for key in ("url", "original_url", "original", "filename"):
+                if info.get(key):
+                    add(info[key])
+                    break
+        elif isinstance(info, str):
+            add(info)
+
+    pic = status.get("pic")
+    if isinstance(pic, str) and pic.strip():
+        for part in re.split(r"[\s,]+", pic.strip()):
+            add(part)
+    elif isinstance(pic, list):
+        for part in pic:
+            add(part)
+
+    add(status.get("first_img"))
+    return list(urls_by_source.values())
+
+
+def image_source_key(url: str) -> str:
+    """Ignore Xueqiu size suffixes such as !thumb.jpg / !custom.jpg."""
+    return url.split("?", 1)[0].split("!", 1)[0]
+
+
+def merge_image_records(
+    existing: list[Any] | None,
+    urls: list[str],
+) -> list[dict[str, str]]:
+    """Keep local paths when the same photo comes back as a different size URL."""
+    by_source: dict[str, dict[str, str]] = {}
+    for image in existing or []:
+        if not isinstance(image, dict) or not image.get("url"):
+            continue
+        by_source[image_source_key(str(image["url"]))] = image
+    merged: list[dict[str, str]] = []
+    for url in urls:
+        source = image_source_key(url)
+        previous = by_source.get(source)
+        if previous:
+            record = dict(previous)
+            record["url"] = url
+            merged.append(record)
+        else:
+            merged.append({"url": url})
+    return merged
+
+
+def image_needs_download(image: Any) -> bool:
+    if not isinstance(image, dict) or not image.get("url"):
+        return False
+    path_value = image.get("path")
+    if not path_value:
+        return True
+    return not Path(str(path_value)).expanduser().is_file()
+
+
+def post_images_need_download(post: dict[str, Any]) -> bool:
+    if any(image_needs_download(image) for image in post.get("images") or []):
+        return True
+    quoted = post.get("retweeted_status")
+    if isinstance(quoted, dict):
+        return any(image_needs_download(image) for image in quoted.get("images") or [])
+    return False
+
+
+def guess_image_extension(url: str, content_type: str | None = None) -> str:
+    path = url.split("?", 1)[0]
+    # 雪球常见：xxx.png!800.jpg，优先取原始扩展名。
+    bare = path.split("!")[0]
+    suffix = Path(bare).suffix.lower()
+    if suffix in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
+        return ".jpg" if suffix == ".jpeg" else suffix
+    if content_type:
+        mapping = {
+            "image/jpeg": ".jpg",
+            "image/jpg": ".jpg",
+            "image/png": ".png",
+            "image/gif": ".gif",
+            "image/webp": ".webp",
+        }
+        for mime, ext in mapping.items():
+            if mime in content_type.lower():
+                return ext
+    return ".jpg"
+
+
+def download_images(
+    page_obj: Any,
+    post_id: Any,
+    image_urls: list[str],
+    images_dir: Path,
+) -> list[dict[str, str]]:
+    """下载帖子图片；失败时仍保留远程 URL。"""
+    saved: list[dict[str, str]] = []
+    if not image_urls:
+        return saved
+    post_dir = images_dir / str(post_id)
+    post_dir.mkdir(parents=True, exist_ok=True)
+    for index, url in enumerate(image_urls, start=1):
+        item: dict[str, str] = {"url": url}
+        try:
+            response = page_obj.request.get(
+                url,
+                headers={"Referer": f"{BASE_URL}/"},
+                timeout=30_000,
+            )
+            if not response.ok:
+                item["error"] = f"HTTP {response.status}"
+                saved.append(item)
+                continue
+            content_type = response.headers.get("content-type")
+            extension = guess_image_extension(url, content_type)
+            filename = f"{index:02d}{extension}"
+            path = post_dir / filename
+            path.write_bytes(response.body())
+            item["path"] = str(path)
+        except Exception as exc:  # noqa: BLE001 - 单张失败不中断整页
+            item["error"] = str(exc).splitlines()[0]
+        saved.append(item)
+    return saved
+
+
+def ensure_post_images(page_obj: Any, post: dict[str, Any], images_dir: Path) -> int:
+    """Download any missing local files for a post and its quoted original."""
+    saved = 0
+    images = post.get("images") or []
+    urls = [
+        str(image["url"])
+        for image in images
+        if isinstance(image, dict) and image.get("url")
+    ]
+    if urls and any(image_needs_download(image) for image in images):
+        post["images"] = download_images(page_obj, post.get("id"), urls, images_dir)
+        saved += sum(1 for image in post["images"] if image.get("path"))
+    quoted = post.get("retweeted_status")
+    if isinstance(quoted, dict):
+        quote_images = quoted.get("images") or []
+        quote_urls = [
+            str(image["url"])
+            for image in quote_images
+            if isinstance(image, dict) and image.get("url")
+        ]
+        if quote_urls and any(image_needs_download(image) for image in quote_images):
+            quoted["images"] = download_images(
+                page_obj, f"{post.get('id')}_rt", quote_urls, images_dir
+            )
+            saved += sum(1 for image in quoted["images"] if image.get("path"))
+    return saved
 
 
 def iso_time(milliseconds: int | None) -> str | None:
@@ -64,6 +281,8 @@ def browser_cookies(cookie_header: str) -> list[dict[str, str]]:
 def normalize_status(status: dict[str, Any]) -> dict[str, Any]:
     user = status.get("user") or {}
     retweeted = status.get("retweeted_status") or {}
+    image_urls = extract_image_urls(status)
+    retweet_images = extract_image_urls(retweeted) if retweeted else []
     return {
         "id": status.get("id"),
         "url": f"{BASE_URL}{status.get('target', '')}" if status.get("target") else None,
@@ -80,17 +299,59 @@ def normalize_status(status: dict[str, Any]) -> dict[str, Any]:
         "retweet_count": status.get("retweet_count", 0),
         "like_count": status.get("like_count", status.get("fav_count", 0)),
         "view_count": status.get("view_count", 0),
+        "images": [{"url": url} for url in image_urls],
+        "full_text": False,
         "is_retweet": bool(status.get("retweet_status_id") or retweeted),
         "retweeted_status": (
             {
                 "id": retweeted.get("id"),
                 "author": (retweeted.get("user") or {}).get("screen_name"),
                 "text": plain_text(retweeted.get("text") or retweeted.get("description")),
+                "images": [{"url": url} for url in retweet_images],
             }
             if retweeted
             else None
         ),
     }
+
+
+def apply_detail_to_post(post: dict[str, Any], detail: dict[str, Any] | None) -> dict[str, Any]:
+    """用详情接口补全文、图片和关联原帖。"""
+    if not detail or detail.get("error_code"):
+        return post
+
+    text = plain_text(detail.get("text") or detail.get("description"))
+    if text:
+        post["text"] = text
+    if detail.get("title"):
+        post["title"] = plain_text(detail.get("title"))
+
+    image_urls = extract_image_urls(detail)
+    if image_urls:
+        post["images"] = merge_image_records(post.get("images"), image_urls)
+
+    quoted_detail = detail.get("retweeted_status")
+    quoted = post.get("retweeted_status")
+    if isinstance(quoted_detail, dict):
+        quote_text = plain_text(quoted_detail.get("text") or quoted_detail.get("description"))
+        quote_images = extract_image_urls(quoted_detail)
+        if not isinstance(quoted, dict):
+            quoted = {
+                "id": quoted_detail.get("id"),
+                "author": (quoted_detail.get("user") or {}).get("screen_name"),
+                "text": quote_text,
+                "images": [{"url": url} for url in quote_images],
+            }
+            post["retweeted_status"] = quoted
+            post["is_retweet"] = True
+        else:
+            if quote_text:
+                quoted["text"] = quote_text
+            if quote_images:
+                quoted["images"] = merge_image_records(quoted.get("images"), quote_images)
+
+    post["full_text"] = True
+    return post
 
 
 def write_checkpoint(
@@ -163,53 +424,20 @@ def load_checkpoint(
     return posts, metadata, int(last_completed_page)
 
 
-def fetch_timeline_page(
+def fetch_json(
     page_obj: Any,
-    user_id: str,
-    page: int,
+    url: str,
     timeout_seconds: float,
     retries: int,
     waf_cooldown: float,
+    label: str,
 ) -> dict[str, Any]:
-    """抓取一页；网络超时和临时服务错误会自动重试。"""
+    """在浏览器会话中请求 JSON，并对临时错误自动重试。"""
     for attempt in range(1, retries + 2):
         try:
             return page_obj.evaluate(
-                """async ({api, userId, page, timeoutMs}) => {
-                    const url = new URL(api);
-                    url.searchParams.set("page", String(page));
-                    url.searchParams.set("user_id", userId);
-                    const controller = new AbortController();
-                    const timer = setTimeout(() => controller.abort(), timeoutMs);
-                    try {
-                        const response = await fetch(url, {
-                            credentials: "include",
-                            signal: controller.signal,
-                        });
-                        const text = await response.text();
-                        if (!response.ok) {
-                            throw new Error(`HTTP ${response.status}: ${text.slice(0, 200)}`);
-                        }
-                        try {
-                            return JSON.parse(text);
-                        } catch {
-                            throw new Error(`接口未返回 JSON: ${text.slice(0, 200)}`);
-                        }
-                    } catch (error) {
-                        if (error?.name === "AbortError") {
-                            throw new Error(`请求超时（${timeoutMs / 1000} 秒）`);
-                        }
-                        throw error;
-                    } finally {
-                        clearTimeout(timer);
-                    }
-                }""",
-                {
-                    "api": TIMELINE_API,
-                    "userId": user_id,
-                    "page": page,
-                    "timeoutMs": int(timeout_seconds * 1000),
-                },
+                FETCH_JSON_JS,
+                {"url": url, "timeoutMs": int(timeout_seconds * 1000)},
             )
         except PlaywrightError as exc:
             message = str(exc)
@@ -235,13 +463,44 @@ def fetch_timeline_page(
             else:
                 wait_seconds = min(60.0, 5.0 * (2 ** (attempt - 1))) + random.uniform(0, 2)
             print(
-                f"第 {page} 页请求失败，{wait_seconds:.1f} 秒后重试"
+                f"{label}请求失败，{wait_seconds:.1f} 秒后重试"
                 f"（{attempt}/{retries}）：{message.splitlines()[0]}",
                 file=sys.stderr,
             )
             time.sleep(wait_seconds)
 
     raise RuntimeError("不可达的重试状态")
+
+
+def fetch_timeline_page(
+    page_obj: Any,
+    user_id: str,
+    page: int,
+    timeout_seconds: float,
+    retries: int,
+    waf_cooldown: float,
+) -> dict[str, Any]:
+    url = f"{TIMELINE_API}?page={page}&user_id={user_id}"
+    return fetch_json(page_obj, url, timeout_seconds, retries, waf_cooldown, f"第 {page} 页")
+
+
+def fetch_status_detail(
+    page_obj: Any,
+    status_id: Any,
+    timeout_seconds: float,
+    retries: int,
+    waf_cooldown: float,
+) -> dict[str, Any] | None:
+    url = f"{STATUS_API}?id={status_id}"
+    payload = fetch_json(page_obj, url, timeout_seconds, retries, waf_cooldown, f"帖子 {status_id}")
+    if payload.get("error_code"):
+        return None
+    return payload
+
+
+def pause_between_details(delay: float) -> None:
+    if delay > 0:
+        time.sleep(delay + random.uniform(0, min(delay, 1.0)))
 
 
 def crawl(
@@ -258,6 +517,10 @@ def crawl(
     retries: int,
     recycle_every: int,
     waf_cooldown: float,
+    save_images: bool = True,
+    images_dir: Path | None = None,
+    full_text: bool = True,
+    detail_delay: float = 1.0,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     existing_metadata: dict[str, Any] = {}
     last_completed_page = 0
@@ -273,8 +536,20 @@ def crawl(
     seen_ids = {post["id"] for post in results if post.get("id") is not None}
     max_page = existing_metadata.get("available_pages")
     started_at = existing_metadata.get("started_at") or datetime.now().astimezone().isoformat()
+    image_root = (images_dir or Path("output/images")).expanduser().resolve()
 
-    if last_completed_page >= pages:
+    pending_full_text = (
+        [post for post in results if post.get("id") and not post.get("full_text")]
+        if full_text
+        else []
+    )
+    pending_images = (
+        [post for post in results if post_images_need_download(post)]
+        if save_images
+        else []
+    )
+    timeline_done = last_completed_page >= pages
+    if timeline_done and not pending_full_text and not pending_images:
         metadata = write_checkpoint(
             output_path,
             user_id,
@@ -323,10 +598,73 @@ def crawl(
 
             # 重抓断点页并按 ID 去重，降低断点期间出现新帖造成分页错位的风险。
             page = max(1, last_completed_page)
-            complete = False
+            complete = timeline_done
             pages_on_current_tab = 0
             print(f"准备从第 {page} 页开始请求", file=sys.stderr)
-            while page <= pages:
+            if save_images:
+                print(f"图片将保存到：{image_root}", file=sys.stderr)
+            if full_text:
+                print("将逐条请求帖子详情接口，补全正文全文", file=sys.stderr)
+                pending = [post for post in results if post.get("id") and not post.get("full_text")]
+                if pending:
+                    print(f"已有数据中有 {len(pending)} 条尚无全文，先补全", file=sys.stderr)
+                for index, post in enumerate(pending, start=1):
+                    detail = fetch_status_detail(
+                        page_obj,
+                        post["id"],
+                        request_timeout,
+                        retries,
+                        waf_cooldown,
+                    )
+                    apply_detail_to_post(post, detail)
+                    if save_images:
+                        ensure_post_images(page_obj, post, image_root)
+                    if index % 10 == 0 or index == len(pending):
+                        write_checkpoint(
+                            output_path,
+                            user_id,
+                            pages,
+                            max_page,
+                            last_completed_page,
+                            results,
+                            timeline_done,
+                            started_at,
+                        )
+                        print(
+                            f"已补全文 {index}/{len(pending)} 条",
+                            file=sys.stderr,
+                        )
+                    pause_between_details(detail_delay)
+            if save_images:
+                missing_images = [
+                    post for post in results if post_images_need_download(post)
+                ]
+                if missing_images:
+                    print(
+                        f"有 {len(missing_images)} 条帖子缺少本地图片，开始补下载",
+                        file=sys.stderr,
+                    )
+                for index, post in enumerate(missing_images, start=1):
+                    saved = ensure_post_images(page_obj, post, image_root)
+                    if index % 10 == 0 or index == len(missing_images):
+                        write_checkpoint(
+                            output_path,
+                            user_id,
+                            pages,
+                            max_page,
+                            last_completed_page,
+                            results,
+                            timeline_done,
+                            started_at,
+                        )
+                        print(
+                            f"已补图片 {index}/{len(missing_images)} 条，本批落盘 {saved} 张",
+                            file=sys.stderr,
+                        )
+                    pause_between_details(min(detail_delay, 0.5))
+            if timeline_done:
+                print("时间线已抓完，仅补全文和图片", file=sys.stderr)
+            while page <= pages and not timeline_done:
                 payload = fetch_timeline_page(
                     page_obj,
                     user_id,
@@ -341,13 +679,29 @@ def crawl(
                 if not statuses:
                     complete = True
                     break
+                page_image_count = 0
                 for status in statuses:
                     status_id = status.get("id")
                     if status_id in seen_ids:
                         continue
                     if status_id is not None:
                         seen_ids.add(status_id)
-                    results.append(normalize_status(status))
+                    post = normalize_status(status)
+                    if full_text and post.get("id") and not post.get("full_text"):
+                        detail = fetch_status_detail(
+                            page_obj,
+                            post["id"],
+                            request_timeout,
+                            retries,
+                            waf_cooldown,
+                        )
+                        apply_detail_to_post(post, detail)
+                        pause_between_details(detail_delay)
+                    if save_images:
+                        page_image_count += ensure_post_images(
+                            page_obj, post, image_root
+                        )
+                    results.append(post)
 
                 last_completed_page = page
                 complete = page >= pages or bool(max_page and page >= int(max_page))
@@ -361,8 +715,11 @@ def crawl(
                     complete,
                     started_at,
                 )
+                extra = f"，下载图片 {page_image_count} 张" if save_images else ""
+                full_text_count = sum(1 for item in results if item.get("full_text"))
+                extra += f"，全文 {full_text_count} 条" if full_text else ""
                 print(
-                    f"已抓取并保存第 {page} 页，本页 {len(statuses)} 条，累计 {len(results)} 条",
+                    f"已抓取并保存第 {page} 页，本页 {len(statuses)} 条，累计 {len(results)} 条{extra}",
                     file=sys.stderr,
                 )
                 if complete:
@@ -446,6 +803,33 @@ def parse_args() -> argparse.Namespace:
         default=120,
         help="遇到 405/429 后的基础冷却秒数，默认 120",
     )
+    parser.add_argument(
+        "--no-save-images",
+        action="store_true",
+        help="不下载图片到本地，只在 JSON 中保留图片 URL",
+    )
+    parser.add_argument(
+        "--save-images",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--images-dir",
+        type=Path,
+        default=Path("output/images"),
+        help="图片保存目录，默认 output/images",
+    )
+    parser.add_argument(
+        "--no-full-text",
+        action="store_true",
+        help="只用时间线摘要，不请求每条帖子的全文",
+    )
+    parser.add_argument(
+        "--detail-delay",
+        type=float,
+        default=1.0,
+        help="请求每条帖子全文的间隔秒数，默认 1",
+    )
     args = parser.parse_args()
     if args.request_timeout <= 0:
         parser.error("--request-timeout 必须大于 0")
@@ -455,6 +839,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--recycle-every 必须大于 0")
     if args.waf_cooldown < 0:
         parser.error("--waf-cooldown 不能小于 0")
+    if args.detail_delay < 0:
+        parser.error("--detail-delay 不能小于 0")
     return args
 
 
@@ -478,12 +864,27 @@ def main() -> int:
             args.retries,
             args.recycle_every,
             args.waf_cooldown,
+            not args.no_save_images,
+            args.images_dir,
+            not args.no_full_text,
+            args.detail_delay,
         )
     except (OSError, PlaywrightError, ValueError, RuntimeError) as exc:
         print(f"抓取失败：{exc}", file=sys.stderr)
         return 1
 
     print(f"完成：{len(posts)} 条发言已写入 {args.output}")
+    if not args.no_full_text:
+        full_text_count = sum(1 for post in posts if post.get("full_text"))
+        print(f"全文：已补全 {full_text_count} / {len(posts)} 条")
+    if not args.no_save_images:
+        saved = sum(
+            1
+            for post in posts
+            for img in (post.get("images") or [])
+            if img.get("path")
+        )
+        print(f"图片：已落盘 {saved} 张到 {args.images_dir}")
     return 0
 
 

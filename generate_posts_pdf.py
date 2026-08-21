@@ -23,6 +23,7 @@ from reportlab.platypus import (
     BaseDocTemplate,
     Frame,
     HRFlowable,
+    Image,
     KeepTogether,
     NextPageTemplate,
     PageBreak,
@@ -40,6 +41,7 @@ LIGHT = colors.HexColor("#E6ECEF")
 QUOTE_BG = colors.HexColor("#F4F7F8")
 HOT = "#C0392B"
 MUTED_HEX = "#7A858C"
+DEFAULT_PAGES_PER_FILE = 1000
 # 评论≥100、点赞≥1000 时标红。
 DEFAULT_HOT_REPLY = 300
 DEFAULT_HOT_LIKE = 1000
@@ -82,6 +84,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_HOT_LIKE,
         help=f"点赞数达到该值时标红，默认 {DEFAULT_HOT_LIKE}",
+    )
+    parser.add_argument(
+        "--pages-per-file",
+        type=int,
+        default=DEFAULT_PAGES_PER_FILE,
+        help=f"单个 PDF 最多页数，超出后拆分，默认 {DEFAULT_PAGES_PER_FILE}",
     )
     return parser.parse_args()
 
@@ -285,6 +293,95 @@ def metric_html(label: str, value: int, threshold: int) -> str:
     return f'<font color="{color}" size="8">{label} {value:,}</font>'
 
 
+def image_source_key(image: dict[str, Any], path: Path) -> str:
+    """Treat Xueqiu size variants such as !custom and !thumb as one image."""
+    url = str(image.get("url") or "")
+    if url:
+        return url.split("?", 1)[0].split("!", 1)[0]
+    return str(path.resolve())
+
+
+def image_quality(image: dict[str, Any], path: Path) -> tuple[int, int]:
+    url = str(image.get("url") or "").lower()
+    modifier = url.split("!", 1)[1] if "!" in url else ""
+    if "thumb" in modifier:
+        variant = 0
+    elif "custom" in modifier:
+        variant = 2
+    elif modifier:
+        variant = 1
+    else:
+        variant = 3
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = 0
+    return variant, size
+
+
+def unique_local_images(post: dict[str, Any]) -> list[Path]:
+    selected: dict[str, tuple[tuple[int, int], Path]] = {}
+    for image in post.get("images") or []:
+        if not isinstance(image, dict) or not image.get("path"):
+            continue
+        path = Path(str(image["path"])).expanduser()
+        if not path.is_file():
+            continue
+        key = image_source_key(image, path)
+        candidate = (image_quality(image, path), path)
+        current = selected.get(key)
+        if current is None or candidate[0] > current[0]:
+            selected[key] = candidate
+    if selected:
+        return [path for _, path in selected.values()]
+
+    post_id = post.get("id")
+    if post_id is None:
+        return []
+    folder = Path("output/images") / str(post_id)
+    if not folder.is_dir():
+        return []
+    return sorted(
+        path
+        for path in folder.iterdir()
+        if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+    )
+
+
+def fitted_image(path: Path, max_width: float, max_height: float) -> Image | None:
+    try:
+        drawing = Image(str(path))
+        scale = min(
+            1.0,
+            max_width / float(drawing.drawWidth),
+            max_height / float(drawing.drawHeight),
+        )
+        drawing.drawWidth = float(drawing.drawWidth) * scale
+        drawing.drawHeight = float(drawing.drawHeight) * scale
+        drawing.hAlign = "CENTER"
+        return drawing
+    except Exception:
+        return None
+
+
+def post_image_flowables(post: dict[str, Any], max_width: float) -> list[Any]:
+    """Keep images compact so several can share a page, while remaining readable."""
+    paths = unique_local_images(post)
+    if not paths:
+        return []
+
+    flowables: list[Any] = [Spacer(1, 1.8 * mm)]
+    for index, path in enumerate(paths):
+        # About 1/3 of the text area: 2-3 photos per page, still sharp from originals.
+        drawing = fitted_image(path, min(max_width, 135 * mm), 78 * mm)
+        if drawing:
+            flowables.append(drawing)
+            if index != len(paths) - 1:
+                flowables.append(Spacer(1, 2.2 * mm))
+    flowables.append(Spacer(1, 1.8 * mm))
+    return flowables
+
+
 def build_story(
     metadata: dict[str, Any],
     posts: list[dict[str, Any]],
@@ -352,6 +449,7 @@ def build_story(
                 )
             )
         item.append(Paragraph(safe_text(post.get("text")), styles["body"]))
+        item.extend(post_image_flowables(post, PAGE_WIDTH - 42 * mm))
 
         quoted = post.get("retweeted_status")
         if include_quoted_post and isinstance(quoted, dict) and quoted.get("text"):
@@ -360,9 +458,48 @@ def build_story(
             item.append(
                 Paragraph(f"<b>{quote_author}</b><br/>{quote_text}", styles["quote"])
             )
-        story.append(KeepTogether(item))
+            item.extend(post_image_flowables(quoted, PAGE_WIDTH - 50 * mm))
+        has_local_images = bool(unique_local_images(post)) or (
+            include_quoted_post
+            and isinstance(quoted, dict)
+            and bool(unique_local_images(quoted))
+        )
+        if has_local_images:
+            # Images may span several pages; keeping the entire post together
+            # would leave a mostly empty page before it.
+            story.extend(item)
+        else:
+            story.append(KeepTogether(item))
 
     return story
+
+
+def split_pdf_by_pages(source: Path, pages_per_file: int) -> list[Path]:
+    """Split an oversized PDF into sequential parts; keep the original if small enough."""
+    from pypdf import PdfReader, PdfWriter
+
+    if pages_per_file <= 0:
+        raise ValueError("pages_per_file 必须大于 0")
+
+    reader = PdfReader(str(source))
+    total = len(reader.pages)
+    if total <= pages_per_file:
+        return [source]
+
+    outputs: list[Path] = []
+    part_count = (total + pages_per_file - 1) // pages_per_file
+    for part in range(part_count):
+        writer = PdfWriter()
+        start = part * pages_per_file
+        end = min(start + pages_per_file, total)
+        for index in range(start, end):
+            writer.add_page(reader.pages[index])
+        output = source.with_name(f"{source.stem}_part{part + 1:02d}{source.suffix}")
+        with output.open("wb") as handle:
+            writer.write(handle)
+        outputs.append(output)
+    source.unlink(missing_ok=True)
+    return outputs
 
 
 def main() -> None:
@@ -405,7 +542,15 @@ def main() -> None:
         args.hot_like,
     )
     document.build(story)
-    print(f"已生成：{output_path}（{len(posts):,} 条帖子）")
+    parts = split_pdf_by_pages(output_path, args.pages_per_file)
+    if len(parts) == 1:
+        print(f"已生成：{parts[0]}（{len(posts):,} 条帖子）")
+        return
+    print(
+        f"已生成 {len(parts)} 个 PDF（{len(posts):,} 条帖子，每份最多 {args.pages_per_file} 页）："
+    )
+    for part in parts:
+        print(f"  {part}")
 
 
 if __name__ == "__main__":
